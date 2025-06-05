@@ -2,4 +2,5 @@
 
 interface Env {
 	CLIENT_API_KEY: string;
+	CLOUDFLARE_API_TOKEN: string;
 }

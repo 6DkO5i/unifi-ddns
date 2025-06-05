@@ -1,7 +1,11 @@
 import { ClientOptions, Cloudflare } from 'cloudflare';
 import { AAAARecord, ARecord } from 'cloudflare/src/resources/dns/records.js';
-import { Zone } from 'cloudflare/src/resources/zones/zones.js';
 type AddressableRecord = AAAARecord | ARecord;
+
+enum GateUpdateType {
+	DefaultOnly = 'Default',
+	All = 'All',
+}
 
 function successResponse(): Response {
 	return new Response('OK', { status: 200 });
@@ -17,7 +21,7 @@ class HttpError extends Error {
 	}
 }
 
-function constructClientOptions(request: Request, env: Env): ClientOptions {
+function validateClientOptions(request: Request, env: Env): ClientOptions {
 	const authorization = request.headers.get('Authorization');
 	if (!authorization) {
 		throw new HttpError(401, 'Authorization header missing.');
@@ -32,25 +36,34 @@ function constructClientOptions(request: Request, env: Env): ClientOptions {
 	}
 
 	const clientApiKey = decoded.substring(0, index);
-	const cloudflareApiToken = decoded.substring(index + 1);
-
 	if (!clientApiKey || clientApiKey !== env.CLIENT_API_KEY) {
 		throw new HttpError(401, 'Invalid client authentication');
 	}
 	console.log('Client authenticated successfully!');
+
+	var cloudflareApiToken: string;
+	var requestApiToken = decoded.substring(index + 1);
+	if (requestApiToken.includes('CLOUDFLARE')) {
+		if (requestApiToken in env) {
+			cloudflareApiToken = env[requestApiToken as keyof Env];
+		} else {
+			throw new HttpError(401, 'Cloudflare API token could not be determined!.');
+		}
+	} else {
+		cloudflareApiToken = requestApiToken;
+	}
 
 	return {
 		apiToken: cloudflareApiToken
 	};
 }
 
-function constructDNSRecord(request: Request): AddressableRecord {
+function validateChangeRequest(request: Request): { updateHostIp: boolean, updateGatewayIp: boolean, gatewayUpdateType: GateUpdateType, record: AddressableRecord } {
 	const url = new URL(request.url);
 	const params = url.searchParams;
 	let ip = params.get('ip') || params.get('myip');
-	const hostname = params.get('hostname');
 
-	if (ip === null || ip === undefined) {
+	if (ip === null) {
 		throw new HttpError(422, 'The "ip" parameter is required and cannot be empty. Specify ip=auto to use the client IP.');
 	} else if (ip == 'auto') {
 		ip = request.headers.get('CF-Connecting-IP');
@@ -59,27 +72,62 @@ function constructDNSRecord(request: Request): AddressableRecord {
 		}
 	}
 
-	if (hostname === null || hostname === undefined) {
-		throw new HttpError(422, 'The "hostname" parameter is required and cannot be empty.');
-	}
-
 	return {
-		content: ip,
-		name: hostname,
-		type: ip.includes('.') ? 'A' : 'AAAA',
-		ttl: 1,
+		updateHostIp: params.has('hostname'),
+		updateGatewayIp: params.has('gateway'),
+		gatewayUpdateType: params.get('gateway') === 'All' ? GateUpdateType.All : GateUpdateType.DefaultOnly,
+		record: {
+			content: ip,
+			name: params.get('hostname') ?? undefined,
+			type: ip.includes('.') ? 'A' : 'AAAA',
+			ttl: 1,
+		}
 	};
 }
 
-async function updateGatewayLocation(cloudflare: Cloudflare, zone: Zone, newRecord: AddressableRecord, updateDefaultOnly: boolean = true): Promise<Response> {
+async function updateDNSRecord(cloudflare: Cloudflare, zoneId: string, newRecord: AddressableRecord): Promise<Response> {
+
+	const records = (
+		await cloudflare.dns.records.list({
+			zone_id: zoneId,
+			name: newRecord.name as any,
+			type: newRecord.type,
+		})
+	).result;
+
+	if (records.length > 1) {
+		throw new HttpError(400, 'More than one matching record found!');
+	} else if (records.length === 0 || records[0].id === undefined) {
+		throw new HttpError(400, 'No record found! You must first manually create the record.');
+	}
+
+	// Extract current properties
+	const currentRecord = records[0] as AddressableRecord;
+	const proxied = currentRecord.proxied ?? false; // Default to `false` if `proxied` is undefined
+	const comment = currentRecord.comment;
+	const oldIp = currentRecord.content;
+
+	try {
+		await cloudflare.dns.records.update(records[0].id, {
+			content: newRecord.content,
+			zone_id: zoneId,
+			name: newRecord.name as any,
+			type: newRecord.type,
+			proxied, // Pass the existing "proxied" status
+			comment, // Pass the existing "comment"
+		});
+		console.log('DNS record for ' + newRecord.name + '(' + newRecord.type + ') updated successfully from ' + oldIp + ' to ' + newRecord.content);
+	} catch (error) {
+		console.error('Failed to update DNS record:', newRecord, 'Error:', error);
+		throw error;
+	}
+
+	return successResponse();
+}
+
+async function updateGatewayLocation(cloudflare: Cloudflare, accountId: string, newRecord: AddressableRecord, updateType: GateUpdateType = GateUpdateType.DefaultOnly): Promise<Response> {
 
 	console.log('Starting Zero Trust Gateway location updates ...');
-
-	// Get the account ID from the zone
-	const accountId = zone.account?.id;
-	if (!accountId) {
-		throw new HttpError(400, 'No account ID found for the zone.');
-	}
 
 	// Get the locations
 	const locations = (await cloudflare.zeroTrust.gateway.locations.list({ account_id: accountId })).result;
@@ -105,7 +153,7 @@ async function updateGatewayLocation(cloudflare: Cloudflare, zone: Zone, newReco
 			client_default: location.client_default
 		});
 
-		if (!location.client_default && updateDefaultOnly) {
+		if (!location.client_default && updateType === GateUpdateType.DefaultOnly) {
 			console.log('Skipping non-default location:', location.name);
 			continue;
 		}
@@ -135,46 +183,6 @@ async function updateGatewayLocation(cloudflare: Cloudflare, zone: Zone, newReco
 
 }
 
-async function updateDNSRecord(cloudflare: Cloudflare, zone: Zone, newRecord: AddressableRecord): Promise<Response> {
-
-	const records = (
-		await cloudflare.dns.records.list({
-			zone_id: zone.id,
-			name: newRecord.name as any,
-			type: newRecord.type,
-		})
-	).result;
-
-	if (records.length > 1) {
-		throw new HttpError(400, 'More than one matching record found!');
-	} else if (records.length === 0 || records[0].id === undefined) {
-		throw new HttpError(400, 'No record found! You must first manually create the record.');
-	}
-
-	// Extract current properties
-	const currentRecord = records[0] as AddressableRecord;
-	const proxied = currentRecord.proxied ?? false; // Default to `false` if `proxied` is undefined
-	const comment = currentRecord.comment;
-	const oldIp = currentRecord.content;
-
-	try {
-		await cloudflare.dns.records.update(records[0].id, {
-			content: newRecord.content,
-			zone_id: zone.id,
-			name: newRecord.name as any,
-			type: newRecord.type,
-			proxied, // Pass the existing "proxied" status
-			comment, // Pass the existing "comment"
-		});
-		console.log('DNS record for ' + newRecord.name + '(' + newRecord.type + ') updated successfully from ' + oldIp + ' to ' + newRecord.content);
-	} catch (error) {
-		console.error('Failed to update DNS record:', newRecord, 'Error:', error);
-		throw error;
-	}
-
-	return successResponse();
-}
-
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		console.log('Requester IP: ' + request.headers.get('CF-Connecting-IP'));
@@ -183,7 +191,13 @@ export default {
 
 		try {
 			// Construct client options and DNS record
-			const clientOptions = constructClientOptions(request, env);
+			const clientOptions = validateClientOptions(request, env);
+			const { updateHostIp, updateGatewayIp, gatewayUpdateType, record } = validateChangeRequest(request);
+
+			if (!updateHostIp && !updateGatewayIp) {
+				throw new HttpError(400, 'No update requested!');
+			}
+			
 			const cloudflare = new Cloudflare(clientOptions);
 
 			const tokenStatus = (await cloudflare.user.tokens.verify()).status;
@@ -199,13 +213,22 @@ export default {
 			}
 		
 			const zone = zones[0];		
-			const record = constructDNSRecord(request);
 
 			// Update DNS record
-			await updateDNSRecord(cloudflare, zone, record);
+			if (updateHostIp) {
+				console.log('Updating DNS record for ' + record.name + '(' + record.type + ') to ' + record.content);
+				await updateDNSRecord(cloudflare, zone.id, record);
+			}
 
 			// Update Zero Trust Gateway location
-			await updateGatewayLocation(cloudflare, zone, record);
+			if (updateGatewayIp) {
+				const accountId = zone.account?.id;
+				if (!accountId) {
+					throw new HttpError(400, 'No account ID found for the zone.');
+				}
+				console.log('Updating Zero Trust Gateway \'' + gatewayUpdateType + '\' location(s) to ' + record.content);
+				await updateGatewayLocation(cloudflare, accountId, record, gatewayUpdateType);
+			}
 
 			return successResponse();
 
