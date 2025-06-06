@@ -21,7 +21,30 @@ class HttpError extends Error {
 	}
 }
 
-function validateClientOptions(request: Request, env: Env): ClientOptions {
+function validateChangeRequest(request: Request, env: Env): { cloudflareApiToken: string, updateHostIp: boolean, updateGatewayIp: boolean, gatewayUpdateType: GateUpdateType, record: AddressableRecord } {
+	const url = new URL(request.url);
+	const params = url.searchParams;
+	const domain = params.get('domain');
+	
+	if (domain === null) {
+		throw new HttpError(400, 'The "domain" parameter is required and cannot be empty.');
+	}
+
+	const clientApiKeyName = domain + '_' +'CLIENT_API_KEY';
+	if (!(clientApiKeyName in env)) {
+		console.log('Client API Key not configured for domain \'' + domain + '\'.');
+		throw new HttpError(401, 'Domain \'' + domain + '\' not configured for updates.');
+	}
+
+	const cloudflareApiTokenName = domain + '_' +'CLOUDFLARE_API_TOKEN';
+	if (!(cloudflareApiTokenName in env)) {
+		console.log('Cloudflare API Token not configured for domain \'' + domain + '\'.');
+		throw new HttpError(401, 'Domain \'' + domain + '\' not configured for updates.');
+	}
+
+	const clientApiKey = env[clientApiKeyName as keyof Env];
+	const cloudflareApiToken = env[cloudflareApiTokenName as keyof Env];
+
 	const authorization = request.headers.get('Authorization');
 	if (!authorization) {
 		throw new HttpError(401, 'Authorization header missing.');
@@ -29,40 +52,22 @@ function validateClientOptions(request: Request, env: Env): ClientOptions {
 
 	const [, data] = authorization.split(' ');
 	const decoded = atob(data);
-	const index = decoded.indexOf(':');
 
-	if (index === -1 || /[\0-\x1F\x7F]/.test(decoded)) {
+	// Check for control characters (null, ASCII 0-31, DEL) which could be used in injection attacks
+	if (/[\0-\x1F\x7F]/.test(decoded)) {
 		throw new HttpError(401, 'Invalid API key or token.');
 	}
 
-	const clientApiKey = decoded.substring(0, index);
-	if (!clientApiKey || clientApiKey !== env.CLIENT_API_KEY) {
-		throw new HttpError(401, 'Invalid client authentication');
+	// Only client API key is expected in the header, so ignore if 'some' password is passed
+	const index = decoded.indexOf(':');
+	const requestApiKey = index === -1 ? decoded : decoded.substring(0, index);
+
+	if (!requestApiKey || requestApiKey !== clientApiKey) {
+		throw new HttpError(401, 'Request failed client authentication');
 	}
 	console.log('Client authenticated successfully!');
 
-	var cloudflareApiToken: string;
-	var requestApiToken = decoded.substring(index + 1);
-	if (requestApiToken.includes('CLOUDFLARE')) {
-		if (requestApiToken in env) {
-			cloudflareApiToken = env[requestApiToken as keyof Env];
-		} else {
-			throw new HttpError(401, 'Cloudflare API token could not be determined!.');
-		}
-	} else {
-		cloudflareApiToken = requestApiToken;
-	}
-
-	return {
-		apiToken: cloudflareApiToken
-	};
-}
-
-function validateChangeRequest(request: Request): { updateHostIp: boolean, updateGatewayIp: boolean, gatewayUpdateType: GateUpdateType, record: AddressableRecord } {
-	const url = new URL(request.url);
-	const params = url.searchParams;
 	let ip = params.get('ip') || params.get('myip');
-
 	if (ip === null) {
 		throw new HttpError(422, 'The "ip" parameter is required and cannot be empty. Specify ip=auto to use the client IP.');
 	} else if (ip == 'auto') {
@@ -73,6 +78,7 @@ function validateChangeRequest(request: Request): { updateHostIp: boolean, updat
 	}
 
 	return {
+		cloudflareApiToken: cloudflareApiToken,
 		updateHostIp: params.has('hostname'),
 		updateGatewayIp: params.has('gateway'),
 		gatewayUpdateType: params.get('gateway') === 'All' ? GateUpdateType.All : GateUpdateType.DefaultOnly,
@@ -190,15 +196,14 @@ export default {
 		console.log('Body: ' + (await request.text()));
 
 		try {
-			// Construct client options and DNS record
-			const clientOptions = validateClientOptions(request, env);
-			const { updateHostIp, updateGatewayIp, gatewayUpdateType, record } = validateChangeRequest(request);
+			// Validate the request and extract the parameters
+			const { cloudflareApiToken, updateHostIp, updateGatewayIp, gatewayUpdateType, record } = validateChangeRequest(request, env);
 
 			if (!updateHostIp && !updateGatewayIp) {
 				throw new HttpError(400, 'No update requested!');
 			}
 			
-			const cloudflare = new Cloudflare(clientOptions);
+			const cloudflare = new Cloudflare({apiToken: cloudflareApiToken});
 
 			const tokenStatus = (await cloudflare.user.tokens.verify()).status;
 			if (tokenStatus !== 'active') {
